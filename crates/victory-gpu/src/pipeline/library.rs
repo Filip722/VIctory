@@ -16,7 +16,7 @@
 //! stores, loads and serialising may overlap.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -134,22 +134,51 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Saves changes to the two caches at most every `SAVE_EVERY` (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
-        }
-        *last = Some(std::time::Instant::now());
+    let Some(dir) = DIR.get() else { return };
+    // Only one save can write the temporary files. Workers needn't wait for it.
+    let mut last = if now {
+        LAST.lock().unwrap_or_else(|e| e.into_inner())
+    } else if let Ok(last) = LAST.try_lock() {
+        last
+    } else {
+        return;
+    };
+    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        return;
     }
+    *last = Some(std::time::Instant::now());
+    save_caches(dir, library(), &USED);
+}
+
+fn save_caches(dir: &Path, library: Option<&Mutex<Library>>, early: &EarlyPipelines) {
+    if early.changed.swap(false, Ordering::Relaxed) {
+        let keys: Vec<String> = early
+            .keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
+        let written = std::fs::create_dir_all(dir)
+            .and_then(|()| write_atomically(&dir.join(EARLY_FILE), keys.join("\n").as_bytes()));
+        match written {
+            Ok(()) => tracing::info!(early = keys.len(), "early title pipelines saved"),
+            Err(e) => {
+                early.changed.store(true, Ordering::Relaxed);
+                tracing::warn!(error = %e, "early title pipelines not saved");
+            }
+        }
+    }
+
+    let Some(library) = library else { return };
     let blob = {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        if l.added == 0 {
             return;
         }
         // SAFETY: a buffer of the size the library asks for.
@@ -168,14 +197,11 @@ pub(crate) fn save(now: bool) {
             }
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob));
     match written {
         Ok(()) => tracing::info!(
             bytes = blob.len(),
-            early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
@@ -194,11 +220,18 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 }
 
 /// Title pipeline keys drawn or dispatched with (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-static USED_CHANGED: AtomicBool = AtomicBool::new(false);
+struct EarlyPipelines {
+    keys: Mutex<Option<HashSet<String>>>,
+    changed: AtomicBool,
+}
+
+static USED: EarlyPipelines = EarlyPipelines {
+    keys: Mutex::new(None),
+    changed: AtomicBool::new(false),
+};
 
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
-    let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut used = USED.keys.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
         let listed = DIR
             .get()
@@ -221,13 +254,47 @@ pub(crate) fn note_used(key: &str) {
     let mut used = used();
     let set = used.get_or_insert_with(HashSet::new);
     if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
-        USED_CHANGED.store(true, Ordering::Relaxed);
+        USED.changed.store(true, Ordering::Relaxed);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saves_early_pipelines_without_a_host_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let early = EarlyPipelines {
+            keys: Mutex::new(Some(HashSet::from(["used-pipeline".to_owned()]))),
+            changed: AtomicBool::new(true),
+        };
+
+        save_caches(dir.path(), None, &early);
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(EARLY_FILE)).unwrap(),
+            "used-pipeline"
+        );
+        assert!(!dir.path().join(LIBRARY_FILE).exists());
+    }
+
+    #[test]
+    fn retries_a_failed_early_pipeline_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(EARLY_FILE);
+        std::fs::create_dir(&file).unwrap();
+        let early = EarlyPipelines {
+            keys: Mutex::new(Some(HashSet::from(["used-pipeline".to_owned()]))),
+            changed: AtomicBool::new(true),
+        };
+
+        save_caches(dir.path(), None, &early);
+        std::fs::remove_dir(&file).unwrap();
+        save_caches(dir.path(), None, &early);
+
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "used-pipeline");
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
