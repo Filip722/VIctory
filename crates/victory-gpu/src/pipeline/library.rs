@@ -321,6 +321,19 @@ mod tests {
         note_used("gfx:alpha_key");
         assert!(USED_CHANGED.load(Ordering::Relaxed));
 
+        // A file in place of the cache directory makes directory creation fail.
+        std::fs::write(&cache_dir, b"occupied").unwrap();
+        save_to(&cache_dir, None);
+        assert!(USED_CHANGED.load(Ordering::Relaxed), "retry directory creation");
+        std::fs::remove_file(&cache_dir).unwrap();
+
+        // A directory in place of the output file makes the atomic rename fail.
+        let early_path = cache_dir.join(EARLY_FILE);
+        std::fs::create_dir_all(&early_path).unwrap();
+        save_to(&cache_dir, None);
+        assert!(USED_CHANGED.load(Ordering::Relaxed), "retry the early-list write");
+        std::fs::remove_dir(&early_path).unwrap();
+
         save_to(&cache_dir, None);
         assert!(cache_dir.join(EARLY_FILE).exists());
         assert!(!cache_dir.join(LIBRARY_FILE).exists());
